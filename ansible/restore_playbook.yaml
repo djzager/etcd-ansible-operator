@@ -1,101 +1,222 @@
 ---
 
 - hosts: localhost
+  vars:
+    cluster_name: "{{ meta.name }}"
+    cluster_namespace: "{{ meta.namespace }}"
+    cluster_cr_lookup: "{{ lookup('k8s', api_version='etcd.database.coreos.com/v1beta2', kind='EtcdCluster', namespace=meta.namespace, resource_name=meta.name) }}"
+    etcd_client_port: 2379
+    etcd_peer_port: 2380
+    etcd_token: "{{ cluster_name | hash('md5') }}"
   tasks:
-  - debug: msg="Running Etcd Ansible Operator Playbook"
-  - name: set fact restore_s3
-    set_fact:
-      restore_s3: true
-  - name: Get EtcdCluster cr and save the spec
-    set_fact:
-      cluster_spec: "{{ lookup('k8s',
-                                api_version='etcd.database.coreos.com/v1beta2',
-                                kind='EtcdCluster',
-                                namespace=meta.namespace,
-                                resource_name=meta.name)
-                      }}"
+    - debug:
+        msg: "Running Etcd Ansible Operator Restore Playbook"
 
-  - name: Delete EtcdCluster cr
-    k8s:
-      state: absent
-      definition:
-        apiVersion: "etcd.database.coreos.com/v1beta2"
-        kind: "EtcdCluster"
-        metadata:
-          name: "{{ cluster_spec.metadata.name }}"
-          namespace: "{{ cluster_spec.metadata.namespace }}"
-    when: cluster_spec.metadata.name is defined and cluster_spec.metadata.namespace is defined
+    # - fetches and deletes the reference EtcdCluster CR
+    - set_fact:
+        cluster_cr: "{{ cluster_cr_lookup }}"
 
-  - name: Wait while all pods terminate
-    vars:
-      - pods: "{{ q('k8s', api_version='v1', kind='Pod', namespace=cluster_spec.metadata.namespace,
-           label_selector='etcd_cluster='+ meta.name + ',app=etcd') }}"
-    set_fact:
-      c_pods: "{{ pods }}"
-    until: pods|length == 0
-    retries: 5
-    delay: 10
+    - fail:
+        msg: |
+          A CR for etcd.database.coreos.com/v1beta2/EtcdCluster could not be
+          found with name ({{ cluster_name }}) in namespace ({{ cluster_namespace }})
+      when: not cluster_cr
 
+    - name: Delete EtcdCluster CR
+      k8s:
+        state: absent
+        definition:
+          apiVersion: "etcd.database.coreos.com/v1beta2"
+          kind: "EtcdCluster"
+          metadata:
+            name: "{{ cluster_name }}"
+            namespace: "{{ cluster_namespace }}"
 
-  - name: Set fact spec.pause to be true
-    set_fact:
-      etcd_api_version: "{{ cluster_spec.apiVersion }}"
-      etcd_kind: "{{ cluster_spec.kind }}"
-      etcd_cluster_metadata: "{{ cluster_spec.metadata }}"
-      etcd_cluster_spec: "{{ cluster_spec.spec | combine({'paused': True, 'size': 1}) }}"
-    when: cluster_spec.metadata.name is defined and cluster_spec.metadata.namespace is defined
+    - name: Wait while all pods + services terminate
+      vars:
+        pods: "{{ q('k8s', api_version='v1', kind='Pod', namespace=cluster_namespace, label_selector='etcd_cluster='+ cluster_name) }}"
+        services: "{{ q('k8s', api_version='v1', kind='Service', namespace=cluster_namespace, label_selector='etcd_cluster='+ cluster_name) }}"
+      debug:
+        msg: Waiting for pods + services to terminate
+      until: pods|length == 0 and services|length == 0
+      retries: 10
+      delay: 10
 
+    # - creates new EtcdCluster CR with same metadata and spec as the reference CR
+    # - and spec.paused=true and status.phase="Running"
+    #  - spec.paused=true: keep operator from touching membership
+    - name: Rebuild the Etcd CR
+      k8s:
+        state: present
+        definition:
+          apiVersion: "etcd.database.coreos.com/v1beta2"
+          kind: "EtcdCluster"
+          metadata:
+            name: "{{ cluster_name }}"
+            namespace: "{{ cluster_namespace }}"
+          spec: "{{ cluster_cr.spec | combine({'paused': True}) }}"
 
-  - name: Create EtcdCluster cr
-    k8s:
-      state: present
-      definition:
-        apiVersion: "{{ etcd_api_version }}"
-        kind: "{{ etcd_kind }}"
-        metadata:
-          name: "{{ etcd_cluster_metadata.name }}"
-          namespace: "{{ etcd_cluster_metadata.namespace }}"
-        spec: "{{ etcd_cluster_spec }}"
-    when: cluster_spec.metadata.name is defined and cluster_spec.metadata.namespace is defined
+    # ------ Below is what the go operator would do, we'll skip that
+    # ------ And create the services ourselves
+    #  - status.phase=Running:
+    #    1. expect operator to setup the services
+    #    2. make operator ignore the "create seed member" phase
+    - name: create client service
+      k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: "{{ cluster_name }}-client"
+            namespace: "{{ cluster_namespace }}"
+            labels:
+              app: "etcd"
+              etcd_cluster: "{{ cluster_name }}"
+          spec:
+            selector:
+              etcd_cluster: "{{ cluster_name }}"
+              app: "etcd"
+            ports:
+            - protocol: TCP
+              targetPort: "{{ etcd_client_port }}"
+              name: client
+              port: "{{ etcd_client_port }}"
 
-  - name: set cluster facts
-    set_fact:
-      size: 1
-      version: "{{ etcd_cluster_spec.version }}"
+    - name: create peer_service
+      k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: "{{ cluster_name }}"
+            namespace: "{{ cluster_namespace }}"
+            labels:
+              app: "etcd"
+              etcd_cluster: "{{ cluster_name }}"
+          spec:
+            selector:
+              etcd_cluster: "{{ cluster_name }}"
+              app: "etcd"
+            clusterIP: None
+            ports:
+            - protocol: TCP
+              targetPort: "{{ etcd_client_port }}"
+              name: client
+              port: "{{ etcd_client_port}}"
+            - protocol: TCP
+              targetPort: "{{ etcd_peer_port }}"
+              name: peer
+              port: "{{ etcd_peer_port}}"
 
-  - import_role:
-      name: "lookup"
+    # - create seed member that would restore data from backup
+    #  - ownerRef to above EtcdCluster CR
+    - name: Create seed member that will restore data from backup
+      vars:
+        pod_name: "{{ cluster_name }}-1234"
+        etcd_listen_peer_url: "http://0.0.0.0:{{ etcd_peer_port }}"
+        etcd_listen_client_url: "http://0.0.0.0:{{ etcd_client_port }}"
+        etcd_peer_url: "http://{{ cluster_name }}-1234.{{ cluster_name }}.{{ cluster_namespace }}.svc.cluster.local:{{ etcd_peer_port }}"
+        etcd_client_url: "http://{{ cluster_name }}-1234.{{ cluster_name }}-client.{{ cluster_namespace }}.svc.cluster.local:{{ etcd_client_port }}"
+      k8s:
+        state: present
+        definition:
+          apiVersion: "v1"
+          kind: "Pod"
+          metadata:
+            name: "{{ pod_name }}"
+            namespace: "{{cluster_namespace}}"
+            labels:
+              app: "etcd"
+              etcd_cluster: "{{ cluster_name }}"
+              etcd_node: "{{ pod_name }}"
+          spec:
+            hostname: "{{ pod_name }}"
+            subdomain: "{{ cluster_name }}"
+            initContainers:
+            - name: "check-dns"
+              image: busybox:1.28.0-glibc
+              command:
+              - /bin/sh
+              - -c
+              - while ( ! nslookup {{ pod_name }}.{{ cluster_name }}.{{ cluster_namespace }}.svc.cluster.local ); do sleep 2; done
+            - name: "fetch-backup"
+              image: "docker.io/alaypatel07/etcd-ansible-restore"
+              command:
+                - "ansible-playbook"
+                - "/tmp/ansible/get_file.yaml"
+                - "-e"
+                - "s_3_path=alay-etcd-backup/etcd.backup"
+                - "-e"
+                - "s_3_aws_secret=aws"
+                - "-e"
+                - "storage_type=S3"
+                - "-e"
+                - "file_path=/var/etcd"
+              imagePullPolicy: Always
+              volumeMounts:
+              - name: "etcd-data"
+                mountPath: "/var/etcd"
+            - name: "restore-datadir"
+              image: quay.io/coreos/etcd:v3.2.13
+              command:
+              - /bin/sh
+              - -ec
+              - "ETCDCTL_API=3 etcdctl snapshot restore /var/etcd/latest.backup --name {{ pod_name }} --initial-cluster {{ pod_name }}={{ etcd_peer_url }} --initial-cluster-token {{ etcd_token }} --initial-advertise-peer-urls {{ etcd_peer_url }} --data-dir /var/etcd/data 2>/dev/termination-log"
+              volumeMounts:
+              - name: "etcd-data"
+                mountPath: "/var/etcd"
+            containers:
+            - name: "etcd"
+              image: quay.io/coreos/etcd:v3.2.13
+              command:
+              - "/usr/local/bin/etcd"
+              - "--data-dir=/var/etcd/data"
+              - "--name={{ pod_name }}"
+              - "--initial-advertise-peer-urls={{ etcd_peer_url }}"
+              - "--listen-peer-urls={{ etcd_listen_peer_url }}"
+              - "--listen-client-urls={{ etcd_listen_client_url}}"
+              - "--advertise-client-urls={{ etcd_client_url}}"
+              - "--initial-cluster={{ pod_name }}={{ etcd_peer_url }}"
+              - "--initial-cluster-state=new"
+              - "--initial-cluster-token={{ etcd_token }}"
+              ports:
+              - containerPort: "{{ etcd_peer_port }}"
+                name: "server"
+                protocol: "TCP"
+              - containerPort: "{{ etcd_client_port }}"
+                name: "client"
+                protocol: "TCP"
+              volumeMounts:
+              - name: "etcd-data"
+                mountPath: "/var/etcd"
+            volumes:
+            - name: "etcd-data"
+              source:
+                emptyDir: {}
+            restartPolicy: "Never"
 
-  - import_role:
-      name: "reconcile"
+    - name: Wait while 1 pods is running
+      vars:
+        - pods: "{{ q('k8s', api_version='v1', kind='Pod', namespace=cluster_namespace, label_selector='etcd_cluster='+ cluster_name) }}"
+      set_fact:
+        c_pods: "{{ pods }}"
+      until: pods|length == 1 and pods[0].status.phase == "Running"
+      retries: 5
+      delay: 10
 
-  - name: Wait while 1 pods is running
-    vars:
-      - pods: "{{ q('k8s', api_version='v1', kind='Pod', namespace=cluster_spec.metadata.namespace,
-           label_selector='etcd_cluster='+ cluster_spec.metadata.name + ',app=etcd') }}"
-    set_fact:
-      c_pods: "{{ pods }}"
-    until: pods|length == 1 and pods[0].status.phase == "Running"
-    retries: 5
-    delay: 10
-
-  - name: Set fact spec.pause to be false
-    set_fact:
-      etcd_cluster_spec: "{{ cluster_spec.spec | combine({'paused': False, 'size': cluster_spec.spec.size}) }}"
-
-
-  - name: Set fact etcd cluster definition
-    set_fact:
-      etcd_cluster_definition:
-        apiVersion: "etcd.database.coreos.com/v1beta2"
-        kind: "EtcdCluster"
-        metadata:
-          name: "{{ meta.name }}"
-          namespace: "{{ meta.namespace }}"
-        spec: "{{ etcd_cluster_spec }}"
-
-  - name: Create EtcdCluster cr
-    k8s:
-      state: present
-      merge_type: merge
-      definition: "{{ etcd_cluster_definition }}"
+    # - update EtcdCluster CR spec.paused=false
+    #  - etcd operator should pick up the membership and scale the etcd cluster
+    - name: Rebuild the Etcd CR
+      k8s:
+        state: present
+        merge_type: merge
+        definition:
+          apiVersion: "etcd.database.coreos.com/v1beta2"
+          kind: "EtcdCluster"
+          metadata:
+            name: "{{ cluster_name }}"
+            namespace: "{{ cluster_namespace }}"
+          spec:
+            paused: False
